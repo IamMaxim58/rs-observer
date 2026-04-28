@@ -1,16 +1,16 @@
 use redis::Value;
 use rs_observer::redis_client::{
     group_metrics_from_xinfo_groups, last_generated_id_from_xinfo, pending_summary_from_xpending,
-    raw_messages_from_xread,
+    raw_messages_from_xread, xread_stream_command,
 };
 
 #[test]
 fn parses_last_generated_id_from_xinfo_stream_response() {
-    let value = Value::Bulk(vec![
-        Value::Data(b"length".to_vec()),
+    let value = Value::Array(vec![
+        Value::BulkString(b"length".to_vec()),
         Value::Int(2),
-        Value::Data(b"last-generated-id".to_vec()),
-        Value::Data(b"1745829221244-0".to_vec()),
+        Value::BulkString(b"last-generated-id".to_vec()),
+        Value::BulkString(b"1745829221244-0".to_vec()),
     ]);
 
     assert_eq!(
@@ -21,15 +21,15 @@ fn parses_last_generated_id_from_xinfo_stream_response() {
 
 #[test]
 fn parses_xread_response_into_raw_messages() {
-    let value = Value::Bulk(vec![Value::Bulk(vec![
-        Value::Data(b"events-00".to_vec()),
-        Value::Bulk(vec![Value::Bulk(vec![
-            Value::Data(b"1745829221244-0".to_vec()),
-            Value::Bulk(vec![
-                Value::Data(b"payload".to_vec()),
-                Value::Data(b"hello".to_vec()),
-                Value::Data(b"type".to_vec()),
-                Value::Data(b"Greeting".to_vec()),
+    let value = Value::Array(vec![Value::Array(vec![
+        Value::BulkString(b"events-00".to_vec()),
+        Value::Array(vec![Value::Array(vec![
+            Value::BulkString(b"1745829221244-0".to_vec()),
+            Value::Array(vec![
+                Value::BulkString(b"payload".to_vec()),
+                Value::BulkString(b"hello".to_vec()),
+                Value::BulkString(b"type".to_vec()),
+                Value::BulkString(b"Greeting".to_vec()),
             ]),
         ])]),
     ])]);
@@ -44,15 +44,29 @@ fn parses_xread_response_into_raw_messages() {
 }
 
 #[test]
+fn builds_nonblocking_xread_for_one_stream() {
+    let command = xread_stream_command("events-00", "10-0".parse().unwrap());
+    let packed = String::from_utf8(command.get_packed_command()).unwrap();
+
+    assert!(packed.contains("XREAD"));
+    assert!(packed.contains("COUNT"));
+    assert!(packed.contains("STREAMS"));
+    assert!(packed.contains("events-00"));
+    assert!(packed.contains("10-0"));
+    assert!(!packed.contains("BLOCK"));
+    assert!(!packed.contains("events-01"));
+}
+
+#[test]
 fn parses_xinfo_groups_response() {
-    let value = Value::Bulk(vec![Value::Bulk(vec![
-        Value::Data(b"name".to_vec()),
-        Value::Data(b"worker-group".to_vec()),
-        Value::Data(b"consumers".to_vec()),
+    let value = Value::Array(vec![Value::Array(vec![
+        Value::BulkString(b"name".to_vec()),
+        Value::BulkString(b"worker-group".to_vec()),
+        Value::BulkString(b"consumers".to_vec()),
         Value::Int(3),
-        Value::Data(b"pending".to_vec()),
+        Value::BulkString(b"pending".to_vec()),
         Value::Int(2),
-        Value::Data(b"lag".to_vec()),
+        Value::BulkString(b"lag".to_vec()),
         Value::Int(7),
     ])]);
 
@@ -68,11 +82,11 @@ fn parses_xinfo_groups_response() {
 
 #[test]
 fn parses_xpending_summary_response() {
-    let value = Value::Bulk(vec![
+    let value = Value::Array(vec![
         Value::Int(4),
-        Value::Data(b"10-0".to_vec()),
-        Value::Data(b"20-0".to_vec()),
-        Value::Bulk(vec![]),
+        Value::BulkString(b"10-0".to_vec()),
+        Value::BulkString(b"20-0".to_vec()),
+        Value::Array(vec![]),
     ]);
 
     let pending = pending_summary_from_xpending("events", "worker-group", value).unwrap();

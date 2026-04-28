@@ -71,7 +71,7 @@ fn run_tui_loop(
         app.log_view_rows = render::body_visible_rows(terminal_area);
 
         let summaries = app.summaries();
-        let timeline = app.selected_timeline_entries();
+        let timeline = app.selected_timeline_window();
         terminal.draw(|frame| {
             render::render(
                 frame,
@@ -86,7 +86,7 @@ fn run_tui_loop(
 
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
-                if let Some(command) = input::command_for_key(key, app.ui.active_panel) {
+                if let Some(command) = input::command_for_key(key, &app.ui) {
                     if !app.handle_command(command) {
                         break;
                     }

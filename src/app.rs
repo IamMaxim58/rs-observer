@@ -10,7 +10,7 @@ use crate::export::{session_jsonl, session_markdown_summary};
 use crate::projection::{LogicalProjectionSummary, ProjectionStore};
 use crate::session::{Session, SessionArchiveSummary};
 use crate::stream_id::StreamId;
-use crate::ui::model::{selected_logical_name, ActivePanel, UiState};
+use crate::ui::model::{selected_logical_name, ActivePanel, PromptKind, UiState};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TimelineEntry {
@@ -19,6 +19,29 @@ pub enum TimelineEntry {
         session_number: u64,
         started_at: DateTime<Utc>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TimelineRow {
+    Message {
+        message: DecodedMessage,
+        search_match: bool,
+    },
+    SessionBoundary {
+        session_number: u64,
+        started_at: DateTime<Utc>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimelineWindow {
+    pub rows: Vec<TimelineRow>,
+    pub selected_message: Option<DecodedMessage>,
+    pub total_messages: usize,
+    pub visible_messages: usize,
+    pub match_count: usize,
+    pub search_query: Option<String>,
+    pub filter_query: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +67,16 @@ pub enum AppCommand {
     HalfPageDown,
     HalfPageUp,
     OpenLogs,
+    BeginSearchPrompt,
+    BeginFilterPrompt,
+    PromptChar(char),
+    PromptBackspace,
+    SubmitPrompt,
+    CancelPrompt,
+    SearchNext,
+    SearchPrevious,
+    JumpTop,
+    JumpBottom,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,28 +161,48 @@ impl App {
     }
 
     pub fn selected_timeline(&self) -> Vec<DecodedMessage> {
-        let summaries = self.summaries();
-        let Some(logical_name) = selected_logical_name(&summaries, &self.ui) else {
-            return Vec::new();
-        };
-
-        let mut messages = Vec::new();
-        for archived in &self.archived_timelines {
-            messages.extend(
-                archived
-                    .messages
-                    .iter()
-                    .filter(|message| message.logical_stream == logical_name)
-                    .cloned(),
-            );
-        }
-        if let Ok(current) = self.projections.timeline(&logical_name) {
-            messages.extend(current);
-        }
-        messages
+        self.selected_filtered_messages()
     }
 
     pub fn selected_timeline_entries(&self) -> Vec<TimelineEntry> {
+        self.selected_timeline_entries_for_filter(true)
+    }
+
+    pub fn selected_timeline_window(&self) -> TimelineWindow {
+        let entries = self.selected_timeline_entries();
+        let total_messages = self.selected_unfiltered_messages().len();
+        let visible_messages = entries
+            .iter()
+            .filter(|entry| matches!(entry, TimelineEntry::Message(_)))
+            .count();
+        let match_count = entries
+            .iter()
+            .filter(|entry| match entry {
+                TimelineEntry::Message(message) => self.message_matches_search(message),
+                TimelineEntry::SessionBoundary { .. } => false,
+            })
+            .count();
+        let selected_message = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                TimelineEntry::Message(message) => Some(message.clone()),
+                TimelineEntry::SessionBoundary { .. } => None,
+            })
+            .nth(self.ui.selected_message);
+        let rows = self.timeline_rows_for_window(&entries);
+
+        TimelineWindow {
+            rows,
+            selected_message,
+            total_messages,
+            visible_messages,
+            match_count,
+            search_query: self.ui.search_query.clone(),
+            filter_query: self.ui.filter_query.clone(),
+        }
+    }
+
+    fn selected_timeline_entries_for_filter(&self, apply_filter: bool) -> Vec<TimelineEntry> {
         let summaries = self.summaries();
         let Some(logical_name) = selected_logical_name(&summaries, &self.ui) else {
             return Vec::new();
@@ -157,34 +210,96 @@ impl App {
 
         let mut entries = Vec::new();
         for archived in &self.archived_timelines {
-            if archived.session_number > 1 {
+            let messages = archived
+                .messages
+                .iter()
+                .filter(|message| message.logical_stream == logical_name)
+                .filter(|message| !apply_filter || self.message_matches_filter(message))
+                .cloned()
+                .collect::<Vec<_>>();
+            if archived.session_number > 1
+                && (!messages.is_empty() || self.ui.filter_query.is_none())
+            {
                 entries.push(TimelineEntry::SessionBoundary {
                     session_number: archived.session_number,
                     started_at: archived.started_at,
                 });
             }
-            entries.extend(
-                archived
-                    .messages
-                    .iter()
-                    .filter(|message| message.logical_stream == logical_name)
-                    .cloned()
-                    .map(TimelineEntry::Message),
-            );
+            entries.extend(messages.into_iter().map(TimelineEntry::Message));
         }
 
         let current_session = self.projections.session();
-        if current_session.number > 1 {
+        let current = self
+            .projections
+            .timeline(&logical_name)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|message| !apply_filter || self.message_matches_filter(message))
+            .collect::<Vec<_>>();
+        if current_session.number > 1 && (!current.is_empty() || self.ui.filter_query.is_none()) {
             entries.push(TimelineEntry::SessionBoundary {
                 session_number: current_session.number,
                 started_at: current_session.started_at,
             });
         }
-        if let Ok(messages) = self.projections.timeline(&logical_name) {
-            entries.extend(messages.into_iter().map(TimelineEntry::Message));
-        }
+        entries.extend(current.into_iter().map(TimelineEntry::Message));
 
         entries
+    }
+
+    fn selected_unfiltered_messages(&self) -> Vec<DecodedMessage> {
+        self.selected_timeline_entries_for_filter(false)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                TimelineEntry::Message(message) => Some(message),
+                TimelineEntry::SessionBoundary { .. } => None,
+            })
+            .collect()
+    }
+
+    fn selected_filtered_messages(&self) -> Vec<DecodedMessage> {
+        self.selected_timeline_entries_for_filter(true)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                TimelineEntry::Message(message) => Some(message),
+                TimelineEntry::SessionBoundary { .. } => None,
+            })
+            .collect()
+    }
+
+    fn timeline_rows_for_window(&self, entries: &[TimelineEntry]) -> Vec<TimelineRow> {
+        let mut rows = Vec::new();
+        let mut skipped_messages = 0;
+        for entry in entries {
+            match entry {
+                TimelineEntry::Message(_) if skipped_messages < self.ui.message_scroll_offset => {
+                    skipped_messages += 1;
+                }
+                TimelineEntry::Message(message) => {
+                    if rows.len() >= self.message_view_rows {
+                        break;
+                    }
+                    rows.push(TimelineRow::Message {
+                        message: message.clone(),
+                        search_match: self.message_matches_search(message),
+                    });
+                }
+                TimelineEntry::SessionBoundary {
+                    session_number,
+                    started_at,
+                } if skipped_messages >= self.ui.message_scroll_offset => {
+                    if rows.len() >= self.message_view_rows {
+                        break;
+                    }
+                    rows.push(TimelineRow::SessionBoundary {
+                        session_number: *session_number,
+                        started_at: *started_at,
+                    });
+                }
+                TimelineEntry::SessionBoundary { .. } => {}
+            }
+        }
+        rows
     }
 
     pub fn handle_worker_event(&mut self, event: WorkerEvent) {
@@ -259,8 +374,40 @@ impl App {
                 self.ui.active_panel = ActivePanel::Logs;
                 self.ui.log_scroll_offset = self.warnings.len().saturating_sub(self.log_view_rows);
             }
+            AppCommand::BeginSearchPrompt => self.ui.begin_search_prompt(),
+            AppCommand::BeginFilterPrompt => self.ui.begin_filter_prompt(),
+            AppCommand::PromptChar(ch) => self.ui.prompt_char(ch),
+            AppCommand::PromptBackspace => self.ui.prompt_backspace(),
+            AppCommand::SubmitPrompt => self.submit_prompt(),
+            AppCommand::CancelPrompt => self.ui.cancel_prompt(),
+            AppCommand::SearchNext => self.select_search_match(true),
+            AppCommand::SearchPrevious => self.select_search_match(false),
+            AppCommand::JumpTop => self.jump_top(),
+            AppCommand::JumpBottom => self.jump_bottom(),
         }
         true
+    }
+
+    fn submit_prompt(&mut self) {
+        let Some(prompt) = self.ui.submit_prompt() else {
+            return;
+        };
+        let value = (!prompt.draft.is_empty()).then_some(prompt.draft);
+        match prompt.kind {
+            PromptKind::Search => self.ui.search_query = value,
+            PromptKind::Filter => {
+                self.ui.filter_query = value;
+                self.ui.selected_message = 0;
+                self.ui.message_scroll_offset = 0;
+            }
+        }
+        let count = self.selected_timeline().len();
+        if count == 0 {
+            self.ui.reset_message_scroll();
+        } else if self.ui.selected_message >= count {
+            self.ui.selected_message = count - 1;
+            self.ui.adjust_message_scroll(count, self.message_view_rows);
+        }
     }
 
     fn half_page_down(&mut self) {
@@ -303,9 +450,78 @@ impl App {
         let session_number = self.projections.session().number + 1;
         let session = Session::new_numbered("session", session_number, baselines);
         self.projections = ProjectionStore::new(self.catalog.clone(), session, 1000);
-        self.ui.reset_message_scroll();
+        if self.ui.active_panel == ActivePanel::StreamDetail {
+            self.jump_bottom();
+        } else {
+            self.ui.reset_message_scroll();
+        }
         self.markers.clear();
         self.bookmarks.clear();
+    }
+
+    fn jump_top(&mut self) {
+        match self.ui.active_panel {
+            ActivePanel::Dashboard => self.ui.selected_stream = 0,
+            ActivePanel::StreamDetail => self.ui.reset_message_scroll(),
+            ActivePanel::Logs => self.ui.log_scroll_offset = 0,
+        }
+    }
+
+    fn jump_bottom(&mut self) {
+        match self.ui.active_panel {
+            ActivePanel::Dashboard => {
+                self.ui.selected_stream = self.summaries().len().saturating_sub(1);
+            }
+            ActivePanel::StreamDetail => {
+                let count = self.selected_timeline().len();
+                if count == 0 {
+                    self.ui.reset_message_scroll();
+                } else {
+                    self.ui.selected_message = count - 1;
+                    self.ui.message_scroll_offset = count.saturating_sub(self.message_view_rows);
+                }
+            }
+            ActivePanel::Logs => {
+                self.ui.log_scroll_offset = self.warnings.len().saturating_sub(self.log_view_rows);
+            }
+        }
+    }
+
+    fn select_search_match(&mut self, forward: bool) {
+        if self.ui.active_panel != ActivePanel::StreamDetail || self.ui.search_query.is_none() {
+            return;
+        }
+        let messages = self.selected_timeline();
+        if messages.is_empty() {
+            return;
+        }
+        let mut indexes = messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| self.message_matches_search(message).then_some(index))
+            .collect::<Vec<_>>();
+        if indexes.is_empty() {
+            return;
+        }
+        indexes.sort_unstable();
+        let selected = self.ui.selected_message;
+        let next = if forward {
+            indexes
+                .iter()
+                .copied()
+                .find(|index| *index > selected)
+                .unwrap_or(indexes[0])
+        } else {
+            indexes
+                .iter()
+                .rev()
+                .copied()
+                .find(|index| *index < selected)
+                .unwrap_or(*indexes.last().unwrap())
+        };
+        self.ui.selected_message = next;
+        self.ui
+            .adjust_message_scroll(messages.len(), self.message_view_rows);
     }
 
     fn bookmark_selected(&mut self) {
@@ -338,4 +554,39 @@ impl App {
         )?;
         Ok(())
     }
+
+    fn message_matches_filter(&self, message: &DecodedMessage) -> bool {
+        self.ui
+            .filter_query
+            .as_ref()
+            .is_none_or(|query| message_matches_query(message, query))
+    }
+
+    fn message_matches_search(&self, message: &DecodedMessage) -> bool {
+        self.ui
+            .search_query
+            .as_ref()
+            .is_some_and(|query| message_matches_query(message, query))
+    }
+}
+
+fn message_matches_query(message: &DecodedMessage, query: &str) -> bool {
+    message_render_text(message).contains(&query.to_lowercase())
+}
+
+fn message_render_text(message: &DecodedMessage) -> String {
+    let shard = message
+        .shard
+        .map(|shard| format!("{shard:02}"))
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "{} {} {} {} {} {}",
+        message.stream,
+        shard,
+        message.id,
+        message.message_type,
+        message.decoded,
+        message.decode_error.as_deref().unwrap_or("")
+    )
+    .to_lowercase()
 }

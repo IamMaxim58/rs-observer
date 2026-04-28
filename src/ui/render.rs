@@ -5,7 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 
-use crate::app::TimelineEntry;
+use crate::app::{TimelineRow, TimelineWindow};
 use crate::decoder::DecodedMessage;
 use crate::projection::LogicalProjectionSummary;
 use crate::ui::model::{status_label, ActivePanel, UiState};
@@ -21,7 +21,7 @@ pub fn render(
     frame: &mut Frame<'_>,
     state: &UiState,
     summaries: &[LogicalProjectionSummary],
-    timeline: &[TimelineEntry],
+    timeline: &TimelineWindow,
     warnings: &[String],
     marker_count: usize,
     bookmark_count: usize,
@@ -45,10 +45,10 @@ pub fn render(
     );
     match state.active_panel {
         ActivePanel::Dashboard => render_dashboard(frame, root[1], state, summaries),
-        ActivePanel::StreamDetail => render_detail(frame, root[1], state, timeline),
+        ActivePanel::StreamDetail => render_detail(frame, root[1], timeline),
         ActivePanel::Logs => render_logs(frame, root[1], state, warnings),
     }
-    render_footer(frame, root[2], state.active_panel);
+    render_footer(frame, root[2], state);
 }
 
 pub fn detail_timeline_visible_rows(area: Rect) -> usize {
@@ -179,14 +179,10 @@ fn render_dashboard(
     frame.render_widget(table, area);
 }
 
-fn render_detail(frame: &mut Frame<'_>, area: Rect, state: &UiState, timeline: &[TimelineEntry]) {
+fn render_detail(frame: &mut Frame<'_>, area: Rect, timeline: &TimelineWindow) {
     let layout = detail_layout(area);
 
-    let rows = timeline_rows(
-        timeline,
-        state.message_scroll_offset,
-        state.selected_message,
-    );
+    let rows = timeline_rows(timeline);
     let table = Table::new(
         rows,
         [
@@ -212,7 +208,9 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, state: &UiState, timeline: &
         layout.separator,
     );
 
-    let inspector = selected_message(timeline, state.selected_message)
+    let inspector = timeline
+        .selected_message
+        .as_ref()
         .map(inspector_text)
         .unwrap_or_else(|| "No message selected".to_string());
     frame.render_widget(
@@ -221,79 +219,53 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, state: &UiState, timeline: &
     );
 }
 
-fn timeline_rows(
-    timeline: &[TimelineEntry],
-    message_scroll_offset: usize,
-    selected_message: usize,
-) -> Vec<Row<'static>> {
-    let mut skipped_messages = 0;
-    let mut message_index = 0;
-    let mut rows = Vec::new();
-
-    for entry in timeline {
-        match entry {
-            TimelineEntry::Message(_) if skipped_messages < message_scroll_offset => {
-                skipped_messages += 1;
-                message_index += 1;
-            }
-            TimelineEntry::Message(message) => {
-                let style = if message_index == selected_message {
+fn timeline_rows(timeline: &TimelineWindow) -> Vec<Row<'static>> {
+    timeline
+        .rows
+        .iter()
+        .map(|entry| match entry {
+            TimelineRow::Message {
+                message,
+                search_match,
+            } => {
+                let style = if timeline.selected_message.as_ref().is_some_and(|selected| {
+                    selected.id == message.id && selected.stream == message.stream
+                }) {
                     Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else if *search_match {
+                    Style::default().fg(Color::Black).bg(Color::Yellow)
                 } else if message.decode_error.is_some() {
                     Style::default().fg(Color::Red)
                 } else {
                     Style::default()
                 };
-                rows.push(
-                    Row::new([
-                        Cell::from(message.observed_at.format("%H:%M:%S").to_string()),
-                        Cell::from(
-                            message
-                                .shard
-                                .map(|shard| format!("{shard:02}"))
-                                .unwrap_or_else(|| "-".to_string()),
-                        ),
-                        Cell::from(message.id.to_string()),
-                        Cell::from(message.message_type.clone()),
-                        Cell::from(compact_json(&message.decoded)),
-                    ])
-                    .style(style),
-                );
-                message_index += 1;
+                Row::new([
+                    Cell::from(message.observed_at.format("%H:%M:%S").to_string()),
+                    Cell::from(
+                        message
+                            .shard
+                            .map(|shard| format!("{shard:02}"))
+                            .unwrap_or_else(|| "-".to_string()),
+                    ),
+                    Cell::from(message.id.to_string()),
+                    Cell::from(message.message_type.clone()),
+                    Cell::from(compact_json(&message.decoded)),
+                ])
+                .style(style)
             }
-            TimelineEntry::SessionBoundary {
+            TimelineRow::SessionBoundary {
                 session_number,
                 started_at,
-            } if skipped_messages >= message_scroll_offset => {
-                rows.push(
-                    Row::new([
-                        Cell::from(""),
-                        Cell::from(""),
-                        Cell::from(""),
-                        Cell::from("session"),
-                        Cell::from(session_boundary_text(*session_number, *started_at)),
-                    ])
-                    .style(Style::default().fg(Color::DarkGray)),
-                );
-            }
-            TimelineEntry::SessionBoundary { .. } => {}
-        }
-    }
-
-    rows
-}
-
-fn selected_message(
-    timeline: &[TimelineEntry],
-    selected_message: usize,
-) -> Option<&DecodedMessage> {
-    timeline
-        .iter()
-        .filter_map(|entry| match entry {
-            TimelineEntry::Message(message) => Some(message),
-            TimelineEntry::SessionBoundary { .. } => None,
+            } => Row::new([
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from("session"),
+                Cell::from(session_boundary_text(*session_number, *started_at)),
+            ])
+            .style(Style::default().fg(Color::DarkGray)),
         })
-        .nth(selected_message)
+        .collect()
 }
 
 pub fn session_boundary_text(session_number: u64, started_at: DateTime<Utc>) -> String {
@@ -350,13 +322,22 @@ fn compact_json(value: &serde_json::Value) -> String {
     }
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, panel: ActivePanel) {
-    let text = match panel {
-        ActivePanel::Dashboard => " q quit  j/k select  enter open  ^l logs  n new  m marker  e export ",
+fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
+    let text = if let Some(prompt) = &state.prompt {
+        let prefix = match prompt.kind {
+            crate::ui::model::PromptKind::Search => "/",
+            crate::ui::model::PromptKind::Filter => "filter: ",
+        };
+        format!("{prefix}{}", prompt.draft)
+    } else {
+        match state.active_panel {
+        ActivePanel::Dashboard => " q quit  j/k select  g/G top/bottom  enter open  ^n new  ^l logs  m marker  e export ",
         ActivePanel::StreamDetail => {
-            " esc back  j/k message  ^d/^u half-page  ^l logs  b bookmark  m marker  e export  q quit "
+            " esc back  j/k message  g/G top/bottom  / search  f filter  n/N match  ^n new  q quit "
         }
-        ActivePanel::Logs => " esc back  j/k scroll  ^d/^u half-page  q quit ",
+        ActivePanel::Logs => " esc back  j/k scroll  g/G top/bottom  ^d/^u half-page  q quit ",
+        }
+        .to_string()
     };
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(Color::White).bg(Color::DarkGray)),

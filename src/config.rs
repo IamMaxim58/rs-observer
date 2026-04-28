@@ -18,7 +18,30 @@ pub struct AppConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RedisConfig {
-    pub url: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub cluster_urls: Vec<String>,
+}
+
+impl RedisConfig {
+    pub fn is_cluster(&self) -> bool {
+        !self.cluster_urls.is_empty()
+    }
+
+    pub fn initial_urls(&self) -> Vec<&str> {
+        if self.is_cluster() {
+            self.cluster_urls.iter().map(String::as_str).collect()
+        } else {
+            self.url.iter().map(String::as_str).collect()
+        }
+    }
+
+    pub fn single_url(&self) -> Result<&str> {
+        self.url
+            .as_deref()
+            .context("redis.url is required when redis.cluster_urls is not configured")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use chrono::{TimeZone, Utc};
 use prost::Message;
-use rs_observer::app::{App, AppCommand, TimelineEntry, WorkerEvent};
+use rs_observer::app::{App, AppCommand, TimelineEntry, TimelineRow, WorkerEvent};
 use rs_observer::catalog::{PhysicalStream, StreamCatalog};
 use rs_observer::config::{DecoderConfig, ProstDecoderConfig};
 use rs_observer::decoder::RawStreamMessage;
@@ -37,6 +37,15 @@ fn raw(stream: &str, id: &str) -> RawStreamMessage {
     }
 }
 
+fn raw_with_payload(stream: &str, id: &str, payload: &str) -> RawStreamMessage {
+    RawStreamMessage {
+        stream: stream.to_string(),
+        id: id.parse().unwrap(),
+        fields: BTreeMap::from([("payload".to_string(), payload.as_bytes().to_vec())]),
+        observed_at: Utc.timestamp_opt(1, 0).unwrap(),
+    }
+}
+
 #[test]
 fn new_session_uses_latest_seen_ids_as_baselines() {
     let mut app = App::with_zero_baselines(catalog());
@@ -56,6 +65,28 @@ fn new_session_uses_latest_seen_ids_as_baselines() {
         app.projections.logical_summary("events").unwrap().new_count,
         1
     );
+}
+
+#[test]
+fn new_session_in_detail_scrolls_to_bottom() {
+    let mut app = App::with_zero_baselines(catalog());
+    app.message_view_rows = 4;
+    app.handle_worker_event(WorkerEvent::MessageObserved(raw("events-00", "10-0")));
+    app.handle_worker_event(WorkerEvent::MessageObserved(raw("events-00", "10-1")));
+    app.handle_command(AppCommand::OpenSelected);
+
+    app.handle_command(AppCommand::NewSession);
+
+    assert_eq!(app.ui.selected_message, 1);
+    assert_eq!(app.ui.message_scroll_offset, 0);
+    let window = app.selected_timeline_window();
+    assert!(matches!(
+        window.rows.last(),
+        Some(TimelineRow::SessionBoundary {
+            session_number: 2,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -121,6 +152,141 @@ fn detail_navigation_skips_new_session_separators() {
 
     assert_eq!(app.ui.selected_message, 1);
     assert_eq!(app.selected_timeline()[1].id.to_string(), "10-1");
+}
+
+#[test]
+fn virtual_timeline_window_contains_only_visible_rows() {
+    let mut app = App::with_zero_baselines(catalog());
+    app.message_view_rows = 7;
+    for i in 0..1000 {
+        app.handle_worker_event(WorkerEvent::MessageObserved(raw(
+            "events-00",
+            &format!("{}-0", i + 1),
+        )));
+    }
+    app.handle_command(AppCommand::OpenSelected);
+    app.handle_command(AppCommand::JumpBottom);
+
+    let window = app.selected_timeline_window();
+
+    assert!(window.rows.len() <= app.message_view_rows);
+    assert_eq!(window.total_messages, 1000);
+    assert_eq!(app.ui.selected_message, 999);
+}
+
+#[test]
+fn search_moves_between_case_insensitive_rendered_text_matches() {
+    let mut app = App::with_zero_baselines(catalog());
+    app.handle_worker_event(WorkerEvent::MessageObserved(raw_with_payload(
+        "events-00",
+        "10-0",
+        "client alpha",
+    )));
+    app.handle_worker_event(WorkerEvent::MessageObserved(raw_with_payload(
+        "events-00",
+        "10-1",
+        "client beta",
+    )));
+    app.handle_worker_event(WorkerEvent::MessageObserved(raw_with_payload(
+        "events-00",
+        "10-2",
+        "CLIENT alpha again",
+    )));
+    app.handle_command(AppCommand::OpenSelected);
+    app.handle_command(AppCommand::BeginSearchPrompt);
+    for ch in "alpha".chars() {
+        app.handle_command(AppCommand::PromptChar(ch));
+    }
+    app.handle_command(AppCommand::SubmitPrompt);
+
+    app.handle_command(AppCommand::SearchNext);
+    assert_eq!(app.ui.selected_message, 2);
+
+    app.handle_command(AppCommand::SearchNext);
+    assert_eq!(app.ui.selected_message, 0);
+
+    app.handle_command(AppCommand::SearchPrevious);
+    assert_eq!(app.ui.selected_message, 2);
+}
+
+#[test]
+fn filter_removes_non_matching_rows_from_detail_only() {
+    let mut app = App::with_zero_baselines(catalog());
+    app.handle_worker_event(WorkerEvent::MessageObserved(raw_with_payload(
+        "events-00",
+        "10-0",
+        "client alpha",
+    )));
+    app.handle_worker_event(WorkerEvent::MessageObserved(raw_with_payload(
+        "events-00",
+        "10-1",
+        "client beta",
+    )));
+    app.handle_command(AppCommand::OpenSelected);
+    app.handle_command(AppCommand::BeginFilterPrompt);
+    for ch in "beta".chars() {
+        app.handle_command(AppCommand::PromptChar(ch));
+    }
+    app.handle_command(AppCommand::SubmitPrompt);
+
+    let visible = app.selected_timeline();
+
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].id.to_string(), "10-1");
+    assert_eq!(
+        app.projections.logical_summary("events").unwrap().new_count,
+        2
+    );
+}
+
+#[test]
+fn empty_prompt_enter_clears_search_or_filter() {
+    let mut app = App::with_zero_baselines(catalog());
+    app.handle_command(AppCommand::BeginSearchPrompt);
+    app.handle_command(AppCommand::PromptChar('x'));
+    app.handle_command(AppCommand::SubmitPrompt);
+    assert_eq!(app.ui.search_query.as_deref(), Some("x"));
+
+    app.handle_command(AppCommand::BeginSearchPrompt);
+    app.handle_command(AppCommand::PromptBackspace);
+    app.handle_command(AppCommand::SubmitPrompt);
+
+    assert_eq!(app.ui.search_query, None);
+}
+
+#[test]
+fn jump_top_and_bottom_work_for_detail_dashboard_and_logs() {
+    let mut app = App::with_zero_baselines(catalog());
+    app.message_view_rows = 4;
+    for i in 0..10 {
+        app.handle_worker_event(WorkerEvent::MessageObserved(raw(
+            "events-00",
+            &format!("{}-0", i + 1),
+        )));
+    }
+    app.handle_command(AppCommand::OpenSelected);
+    app.handle_command(AppCommand::JumpBottom);
+    assert_eq!(app.ui.selected_message, 9);
+    assert_eq!(app.ui.message_scroll_offset, 6);
+    app.handle_command(AppCommand::JumpTop);
+    assert_eq!(app.ui.selected_message, 0);
+    assert_eq!(app.ui.message_scroll_offset, 0);
+
+    app.handle_command(AppCommand::Back);
+    app.handle_command(AppCommand::JumpBottom);
+    assert_eq!(app.ui.selected_stream, 0);
+    app.handle_command(AppCommand::JumpTop);
+    assert_eq!(app.ui.selected_stream, 0);
+
+    app.handle_command(AppCommand::OpenLogs);
+    app.log_view_rows = 2;
+    for i in 0..5 {
+        app.handle_worker_event(WorkerEvent::WorkerWarning(format!("warning {i}")));
+    }
+    app.handle_command(AppCommand::JumpBottom);
+    assert_eq!(app.ui.log_scroll_offset, 3);
+    app.handle_command(AppCommand::JumpTop);
+    assert_eq!(app.ui.log_scroll_offset, 0);
 }
 
 #[test]

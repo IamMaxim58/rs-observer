@@ -15,6 +15,21 @@ pub struct UiState {
     pub log_scroll_offset: usize,
     pub active_panel: ActivePanel,
     pub show_shards: bool,
+    pub prompt: Option<PromptState>,
+    pub search_query: Option<String>,
+    pub filter_query: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptState {
+    pub kind: PromptKind,
+    pub draft: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    Search,
+    Filter,
 }
 
 impl UiState {
@@ -26,6 +41,9 @@ impl UiState {
             log_scroll_offset: 0,
             active_panel: ActivePanel::Dashboard,
             show_shards: false,
+            prompt: None,
+            search_query: None,
+            filter_query: None,
         }
     }
 
@@ -78,6 +96,40 @@ impl UiState {
 
     pub fn scroll_logs_up(&mut self, amount: usize) {
         self.log_scroll_offset = self.log_scroll_offset.saturating_sub(amount.max(1));
+    }
+
+    pub fn begin_search_prompt(&mut self) {
+        self.prompt = Some(PromptState {
+            kind: PromptKind::Search,
+            draft: self.search_query.clone().unwrap_or_default(),
+        });
+    }
+
+    pub fn begin_filter_prompt(&mut self) {
+        self.prompt = Some(PromptState {
+            kind: PromptKind::Filter,
+            draft: self.filter_query.clone().unwrap_or_default(),
+        });
+    }
+
+    pub fn prompt_char(&mut self, ch: char) {
+        if let Some(prompt) = &mut self.prompt {
+            prompt.draft.push(ch);
+        }
+    }
+
+    pub fn prompt_backspace(&mut self) {
+        if let Some(prompt) = &mut self.prompt {
+            prompt.draft.pop();
+        }
+    }
+
+    pub fn cancel_prompt(&mut self) {
+        self.prompt = None;
+    }
+
+    pub fn submit_prompt(&mut self) -> Option<PromptState> {
+        self.prompt.take()
     }
 }
 

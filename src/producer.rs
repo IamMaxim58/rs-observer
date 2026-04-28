@@ -1,14 +1,14 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use prost::Message;
-use redis::aio::ConnectionManager;
 use tokio::time::sleep;
 
 use crate::catalog::{PhysicalStream, StreamCatalog};
-use crate::config::{AppConfig, DecoderConfig, RedisConfig};
+use crate::config::{AppConfig, DecoderConfig};
 use crate::proto_registry::observer::example::{ExampleEvent, ExampleEvent2};
+use crate::redis_client::RedisObserverClient;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProducerMessage {
@@ -73,34 +73,13 @@ impl ProducerMessageFactory {
 pub async fn run_loop(config: AppConfig, interval: Duration) -> Result<()> {
     let catalog = config.catalog()?;
     let mut factory = ProducerMessageFactory::new(&config, &catalog);
-    let mut connection = connect(&config.redis).await?;
+    let mut client = RedisObserverClient::connect(&config.redis).await?;
 
     loop {
         let message = factory.next_message()?;
-        publish(&mut connection, &message).await?;
+        client.xadd(&message.stream, &message.fields).await?;
         sleep(interval).await;
     }
-}
-
-async fn connect(config: &RedisConfig) -> Result<ConnectionManager> {
-    let client = redis::Client::open(config.url.as_str()).context("invalid Redis URL")?;
-    client
-        .get_connection_manager()
-        .await
-        .context("failed to connect to Redis")
-}
-
-async fn publish(connection: &mut ConnectionManager, message: &ProducerMessage) -> Result<()> {
-    let mut cmd = redis::cmd("XADD");
-    cmd.arg(&message.stream).arg("*");
-    for (key, value) in &message.fields {
-        cmd.arg(key).arg(value);
-    }
-    let _: String = cmd
-        .query_async(connection)
-        .await
-        .with_context(|| format!("failed to XADD to `{}`", message.stream))?;
-    Ok(())
 }
 
 fn encode_example_payload(message_name: &str, sequence: u64) -> Result<Vec<u8>> {

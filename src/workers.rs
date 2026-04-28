@@ -89,22 +89,36 @@ async fn tail_loop(
         };
 
         loop {
-            match client.xread_block(&positions, 1000).await {
-                Ok(messages) => {
-                    for message in messages {
-                        positions.insert(message.stream.clone(), message.id);
-                        if sender.send(WorkerEvent::MessageObserved(message)).is_err() {
-                            return;
+            let mut observed_any = false;
+            let mut reconnect = false;
+            for (stream, position) in positions.clone() {
+                match client.xread_stream(&stream, position).await {
+                    Ok(messages) => {
+                        for message in messages {
+                            observed_any = true;
+                            positions.insert(message.stream.clone(), message.id);
+                            if sender.send(WorkerEvent::MessageObserved(message)).is_err() {
+                                return;
+                            }
                         }
                     }
+                    Err(error) => {
+                        let _ = sender.send(WorkerEvent::WorkerWarning(format!(
+                            "Redis tail read failed for `{stream}`: {error}"
+                        )));
+                        sleep(Duration::from_secs(1)).await;
+                        reconnect = true;
+                        break;
+                    }
                 }
-                Err(error) => {
-                    let _ = sender.send(WorkerEvent::WorkerWarning(format!(
-                        "Redis tail read failed: {error}"
-                    )));
-                    sleep(Duration::from_secs(1)).await;
-                    break;
-                }
+            }
+
+            if reconnect {
+                break;
+            }
+
+            if !observed_any {
+                sleep(Duration::from_millis(100)).await;
             }
         }
     }

@@ -96,7 +96,7 @@ fn parses_checked_in_example_config() {
     let config = AppConfig::from_yaml(include_str!("../examples/observer.yaml")).unwrap();
     let catalog = config.catalog().unwrap();
 
-    assert_eq!(config.redis.url, "redis://127.0.0.1/");
+    assert_eq!(config.redis.initial_urls(), ["redis://127.0.0.1/"]);
     assert_eq!(
         config.decoders["sample_event"].payload_field(),
         Some("payload")
@@ -112,5 +112,27 @@ fn parses_checked_in_example_config() {
     assert_eq!(
         catalog.physical("example-event-log").unwrap().decoder,
         "sample_event2"
+    );
+}
+
+#[test]
+fn parses_cluster_redis_nodes() {
+    let config = AppConfig::from_yaml(
+        r#"
+        redis:
+          cluster_urls:
+            - redis://127.0.0.1:7000/
+            - redis://127.0.0.1:7001/
+        streams:
+          - name: example-event-log
+            decoder: raw
+        "#,
+    )
+    .unwrap();
+
+    assert!(config.redis.is_cluster());
+    assert_eq!(
+        config.redis.initial_urls(),
+        ["redis://127.0.0.1:7000/", "redis://127.0.0.1:7001/"]
     );
 }
