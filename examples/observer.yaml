@@ -1,0 +1,28 @@
+redis:
+  url: redis://127.0.0.1/
+
+decoders:
+  raw:
+    kind: raw
+  sample_event:
+    kind: prost
+    message: observer.example.ExampleEvent
+    payload_field: payload
+  sample_event2:
+    kind: prost
+    message: observer.example.ExampleEvent2
+    payload_field: payload
+
+streams:
+  - name: example-event-log
+    decoder: sample_event2
+  - name: notification-outbox
+    decoder: raw
+
+sharded_streams:
+  - name: example-events
+    prefix: example-events-
+    start: 0
+    end: 15
+    width: 2
+    decoder: sample_event

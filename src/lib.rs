@@ -1,0 +1,13 @@
+pub mod app;
+pub mod catalog;
+pub mod config;
+pub mod decoder;
+pub mod export;
+pub mod producer;
+pub mod projection;
+pub mod proto_registry;
+pub mod redis_client;
+pub mod session;
+pub mod stream_id;
+pub mod ui;
+pub mod workers;

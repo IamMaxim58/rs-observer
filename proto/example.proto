@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package observer.example;
+
+message ExampleEvent {
+  string event_type = 1;
+  string event_id = 2;
+  uint32 attempt = 3;
+}
+
+message ExampleEvent2 {
+  string event_type = 1;
+  string event_id = 2;
+  bool success = 3;
+}
